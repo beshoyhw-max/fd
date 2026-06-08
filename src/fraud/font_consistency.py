@@ -7,13 +7,17 @@ Detects document tampering by analyzing font rendering consistency:
 - OCR confidence variance (edited text has different patterns)
 """
 
+import json
 import logging
+from datetime import datetime
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
 from PIL import Image
 
+from src.config import Config
 from src.models import FraudCheck, Severity
 
 logger = logging.getLogger(__name__)
@@ -24,6 +28,8 @@ CHECK_NAME = "font_consistency"
 def run(
     image: Optional[Image.Image] = None,
     ocr_data: Optional[List[Dict]] = None,
+    invoice_id: Optional[str] = None,
+    image_path: Optional[str] = None,
     **kwargs,
 ) -> FraudCheck:
     """
@@ -32,6 +38,8 @@ def run(
     Args:
         image: PIL Image of the invoice page.
         ocr_data: Per-word OCR data (from Surya OCR or Tesseract) if available.
+        invoice_id: Optional invoice ID for exporting detailed results.
+        image_path: Optional path to original image file (for high-quality export).
 
     Returns:
         FraudCheck with font consistency analysis.
@@ -100,7 +108,7 @@ def run(
             f"(combined: {combined}/100)."
         )
 
-    return FraudCheck(
+    result = FraudCheck(
         name=CHECK_NAME,
         score=combined,
         severity=severity,
@@ -108,6 +116,127 @@ def run(
         detail=detail,
         evidence=evidence,
     )
+
+    # Export detailed results if invoice_id provided
+    if invoice_id:
+        _export_font_consistency(
+            invoice_id=invoice_id,
+            image=image,
+            image_path=image_path,
+            stroke_evidence=stroke_evidence,
+            aa_evidence=aa_evidence,
+            ocr_evidence=ocr_evidence,
+            stroke_score=stroke_score,
+            aa_score=aa_score,
+            ocr_score=ocr_score,
+            combined=combined,
+            severity=severity,
+            triggered=triggered,
+        )
+
+    return result
+
+
+def _export_font_consistency(
+    invoice_id: str,
+    image: Image.Image,
+    image_path: Optional[str] = None,
+    stroke_evidence: Dict = None,
+    aa_evidence: Dict = None,
+    ocr_evidence: Dict = None,
+    stroke_score: int = 0,
+    aa_score: int = 0,
+    ocr_score: int = 0,
+    combined: int = 0,
+    severity: Severity = Severity.LOW,
+    triggered: bool = False,
+):
+    """Export detailed font consistency analysis to JSON file and draw boxes on image."""
+    try:
+        config = Config.get()
+        output_dir = config.font_consistency_dir
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Load original image from file path for best quality
+        if image_path and Path(image_path).exists():
+            original_img = Image.open(image_path)
+        else:
+            original_img = image.copy()
+        output_dir = config.font_consistency_dir
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Get outlier blocks from both analyses
+        stroke_outliers = stroke_evidence.get("outlier_blocks", [])
+        aa_outliers = aa_evidence.get("outlier_blocks", [])
+
+        # Draw red boxes on the image
+        img_array = np.array(original_img)
+        original_height, original_width = img_array.shape[:2]
+
+        # Scale factor from 512 (analysis size) to original image
+        scale_x = original_width / 512
+        scale_y = original_height / 512
+        block_size = int(64 * scale_x)
+
+        # Draw boxes for stroke outliers (red)
+        for block in stroke_outliers:
+            x = int(block["x"] * scale_x)
+            y = int(block["y"] * scale_y)
+            cv2.rectangle(img_array, (x, y), (x + block_size, y + block_size), (0, 0, 255), 3)
+
+        # Draw boxes for anti-aliasing outliers (blue - to distinguish)
+        for block in aa_outliers:
+            x = int(block["x"] * scale_x)
+            y = int(block["y"] * scale_y)
+            cv2.rectangle(img_array, (x, y), (x + block_size, y + block_size), (255, 0, 0), 3)
+
+        # Save the image with boxes
+        result_image = Image.fromarray(img_array)
+        image_path = output_dir / f"{invoice_id}.png"
+        result_image.save(image_path)
+
+        export_data = {
+            "invoice_id": invoice_id,
+            "processed_at": datetime.utcnow().isoformat() + "Z",
+            "combined_score": combined,
+            "severity": severity.value,
+            "triggered": triggered,
+            "stroke_analysis": {
+                "score": stroke_score,
+                "blocks": stroke_evidence.get("block_count", 0),
+                "mean_stroke_width": stroke_evidence.get("mean_stroke_width"),
+                "std_stroke_width": stroke_evidence.get("std_stroke_width"),
+                "coefficient_of_variation": stroke_evidence.get("coefficient_of_variation"),
+                "outlier_blocks": stroke_outliers,
+            },
+            "antialiasing_analysis": {
+                "score": aa_score,
+                "profiles": aa_evidence.get("profile_count", 0),
+                "mean_gradient": aa_evidence.get("mean_gradient"),
+                "std_gradient": aa_evidence.get("std_gradient"),
+                "coefficient_of_variation": aa_evidence.get("coefficient_of_variation"),
+                "outlier_blocks": aa_outliers,
+            },
+            "ocr_confidence": {
+                "score": ocr_score,
+                "word_count": ocr_evidence.get("word_count", 0),
+                "mean_confidence": ocr_evidence.get("mean_confidence"),
+                "std_confidence": ocr_evidence.get("std_confidence"),
+                "low_confidence_pct": ocr_evidence.get("low_confidence_pct"),
+            },
+            "box_colors": {
+                "stroke_outliers": "red",
+                "antialiasing_outliers": "blue",
+            },
+        }
+
+        output_path = output_dir / f"{invoice_id}.json"
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(export_data, f, indent=2, ensure_ascii=False)
+
+        logger.info(f"Exported font consistency analysis to {output_path} and {image_path}")
+    except Exception as e:
+        logger.error(f"Failed to export font consistency analysis: {e}")
 
 
 def _analyze_stroke_consistency(image: Image.Image) -> Tuple[int, Dict]:
@@ -118,6 +247,7 @@ def _analyze_stroke_consistency(image: Image.Image) -> Tuple[int, Dict]:
     Tampered regions show different stroke characteristics.
     """
     gray = np.array(image.convert("L"))
+    original_shape = gray.shape
     gray = cv2.resize(gray, (512, 512))
 
     # Binarize
@@ -163,11 +293,23 @@ def _analyze_stroke_consistency(image: Image.Image) -> Tuple[int, Dict]:
     else:
         score = 0
 
+    # Find outlier blocks (those with stroke width > 1.5 std from mean)
+    outlier_blocks = []
+    threshold = mean_width + 1.5 * std_width if std_width > 0 else mean_width * 2
+    for sw in stroke_widths:
+        if sw["stroke_width"] > threshold:
+            outlier_blocks.append({
+                "x": sw["x"],
+                "y": sw["y"],
+                "stroke_width": sw["stroke_width"],
+            })
+
     evidence = {
         "block_count": len(stroke_widths),
         "mean_stroke_width": round(mean_width, 3),
         "std_stroke_width": round(std_width, 3),
         "coefficient_of_variation": round(cv_width, 3),
+        "outlier_blocks": outlier_blocks,
     }
 
     return score, evidence
@@ -189,6 +331,7 @@ def _analyze_antialiasing(image: Image.Image) -> Tuple[int, Dict]:
     # Analyze edge gradient profiles in blocks
     block_size = 64
     gradient_profiles = []
+    block_positions = []
 
     for y in range(0, gray.shape[0] - block_size, block_size):
         for x in range(0, gray.shape[1] - block_size, block_size):
@@ -209,6 +352,7 @@ def _analyze_antialiasing(image: Image.Image) -> Tuple[int, Dict]:
             if np.any(edge_mask):
                 mean_gradient = float(np.mean(magnitude[edge_mask]))
                 gradient_profiles.append(mean_gradient)
+                block_positions.append((x, y))
 
     if len(gradient_profiles) < 4:
         return 0, {"profile_count": len(gradient_profiles), "insufficient_data": True}
@@ -226,11 +370,25 @@ def _analyze_antialiasing(image: Image.Image) -> Tuple[int, Dict]:
     else:
         score = 0
 
+    # Find outlier blocks (those with gradient > 1.5 std from mean)
+    outlier_blocks = []
+    threshold_high = mean_profile + 1.5 * std_profile if std_profile > 0 else mean_profile * 2
+    threshold_low = mean_profile - 1.5 * std_profile if std_profile > 0 else 0
+    for i, gp in enumerate(gradient_profiles):
+        if gp > threshold_high or (std_profile > 0 and gp < threshold_low):
+            x, y = block_positions[i]
+            outlier_blocks.append({
+                "x": x,
+                "y": y,
+                "gradient": round(gp, 3),
+            })
+
     evidence = {
         "profile_count": len(gradient_profiles),
         "mean_gradient": round(mean_profile, 3),
         "std_gradient": round(std_profile, 3),
         "coefficient_of_variation": round(cv_profile, 3),
+        "outlier_blocks": outlier_blocks,
     }
 
     return score, evidence

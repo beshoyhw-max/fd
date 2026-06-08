@@ -71,6 +71,7 @@ class FraudEngine:
         historical_invoices: Optional[List[Dict[str, Any]]] = None,
         page_image: Optional[Image.Image] = None,
         ocr_data: Optional[List[Dict]] = None,
+        image_path: Optional[str] = None,
     ) -> FraudResult:
         """
         Execute all applicable fraud checks on an invoice.
@@ -206,6 +207,8 @@ class FraudEngine:
                 lambda: font_consistency.run(
                     image=page_image,
                     ocr_data=ocr_data,
+                    invoice_id=invoice.invoice_id,
+                    image_path=image_path,
                 ),
             ))
 
