@@ -290,7 +290,9 @@ class OCRFallback:
 
         if self._easyocr_reader is None:
             # Lazy load EasyOCR reader with common languages
-            self._easyocr_reader = easyocr.Reader(['ch_sim', 'en'], gpu=True)
+            # EasyOCR language compatibility: ch_sim can only be combined with 'en'
+                # For multiple language support, we use the most compatible combination
+                self._easyocr_reader = easyocr.Reader(['ch_sim', 'en'], gpu=True)
 
         # Convert PIL Image to numpy array
         img_array = np.array(img)
@@ -428,6 +430,59 @@ class OCRFallback:
 
         return []
 
+    def get_per_char_confidence_from_path(self, image_path: str) -> List[dict]:
+        """
+        Get per-character/word OCR confidence data from image file path.
+        This method loads the original image directly for best quality.
+
+        Args:
+            image_path: Path to the image file.
+
+        Returns:
+            List of {char, conf, left, top, width, height} dicts.
+        """
+        from pathlib import Path
+
+        if not image_path or not Path(image_path).exists():
+            logger.warning(f"Image path does not exist: {image_path}")
+            return []
+
+        # Try Surya first
+        if SURYA_AVAILABLE and _surya_engine is not None:
+            try:
+                img = Image.open(image_path)
+                result = _surya_engine.get_per_word_data(
+                    img, self._get_surya_languages()
+                )
+                if result:
+                    return result
+            except Exception:
+                logger.warning("Surya per-word data failed, trying PaddleOCR")
+
+        # Try PaddleOCR
+        if PADDLEOCR_AVAILABLE:
+            try:
+                return self._paddleocr_per_char_from_path(image_path)
+            except Exception as e:
+                logger.warning(f"PaddleOCR per-word data failed: {e}, trying EasyOCR")
+
+        # Try EasyOCR
+        if EASYOCR_AVAILABLE:
+            try:
+                return self._easyocr_per_char_from_path(image_path)
+            except Exception as e:
+                logger.warning(f"EasyOCR per-word data failed: {e}, trying Tesseract")
+
+        # Fall back to Tesseract
+        if TESSERACT_AVAILABLE:
+            try:
+                img = Image.open(image_path)
+                return self._tesseract_per_char(img)
+            except Exception as e:
+                logger.warning(f"Tesseract per-word data failed: {e}")
+
+        return []
+
     def _paddleocr_per_char(self, img: Image.Image) -> List[dict]:
         """Get per-word OCR data from PaddleOCR."""
         from paddleocr import PaddleOCR
@@ -474,7 +529,9 @@ class OCRFallback:
 
         if self._easyocr_reader is None:
             # Lazy load EasyOCR reader with common languages
-            self._easyocr_reader = easyocr.Reader(['ch_sim', 'en'], gpu=True)
+            # EasyOCR language compatibility: ch_sim can only be combined with 'en'
+                # For multiple language support, we use the most compatible combination
+                self._easyocr_reader = easyocr.Reader(['ch_sim', 'en'], gpu=True)
 
         # Convert PIL Image to numpy array
         img_array = np.array(img)
@@ -502,6 +559,82 @@ class OCRFallback:
             })
 
         logger.info(f"EasyOCR extracted {len(word_data)} words")
+        return word_data
+
+    def _easyocr_per_char_from_path(self, image_path: str) -> List[dict]:
+        """Get per-word OCR data from EasyOCR using image file path."""
+        import easyocr
+
+        if self._easyocr_reader is None:
+            # Lazy load EasyOCR reader with common languages
+            # EasyOCR language compatibility: ch_sim can only be combined with 'en'
+            self._easyocr_reader = easyocr.Reader(['ch_sim', 'en'], gpu=True)
+
+        # Read directly from file path for best quality
+        results = self._easyocr_reader.readtext(image_path)
+        word_data = []
+        for bbox, text, confidence in results:
+            if not text.strip():
+                continue
+            # bbox is [[x1,y1], [x2,y1], [x2,y2], [x1,y2]]
+            x1 = min(p[0] for p in bbox)
+            y1 = min(p[1] for p in bbox)
+            x2 = max(p[0] for p in bbox)
+            y2 = max(p[1] for p in bbox)
+            width = x2 - x1
+            height = y2 - y1
+            conf_pct = int(confidence * 100) if confidence else 0
+
+            word_data.append({
+                "char": text.strip(),
+                "conf": conf_pct,
+                "left": int(x1),
+                "top": int(y1),
+                "width": int(width),
+                "height": int(height),
+            })
+
+        logger.info(f"EasyOCR extracted {len(word_data)} words from file")
+        return word_data
+
+    def _paddleocr_per_char_from_path(self, image_path: str) -> List[dict]:
+        """Get per-word OCR data from PaddleOCR using image file path."""
+        from paddleocr import PaddleOCR
+
+        if self._paddleocr_reader is None:
+            self._paddleocr_reader = PaddleOCR(use_angle_cls=True, lang='ch')
+
+        # Read directly from file path
+        results = self._paddleocr_reader.ocr(image_path, cls=True)
+        word_data = []
+
+        if results and results[0]:
+            for line in results[0]:
+                bbox = line[0]  # [[x1,y1], [x2,y1], [x2,y2], [x1,y2]]
+                text = line[1][0]
+                confidence = line[1][1]
+
+                if not text.strip():
+                    continue
+
+                x1 = min(p[0] for p in bbox)
+                y1 = min(p[1] for p in bbox)
+                x2 = max(p[0] for p in bbox)
+                y2 = max(p[1] for p in bbox)
+                width = x2 - x1
+                height = y2 - y1
+                conf_pct = int(confidence * 100) if confidence else 0
+
+                word_data.append({
+                    "char": text.strip(),
+                    "conf": conf_pct,
+                    "left": int(x1),
+                    "top": int(y1),
+                    "width": int(width),
+                    "height": int(height),
+                })
+
+        logger.info(f"PaddleOCR extracted {len(word_data)} words from file")
         return word_data
 
     def _tesseract_per_char(self, img: Image.Image) -> List[dict]:
