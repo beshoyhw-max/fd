@@ -1,0 +1,96 @@
+# ============================================================
+# Invoice Fraud Detection System — Configuration
+# ============================================================
+
+# LLM API Configuration
+llm:
+  base_url: "http://127.0.0.1:8080/v1/chat/completions"
+  api_key: "custom-token"
+  model: "Qwen2.5-VL-72B-Instruct"
+
+  # model: "Qwen2.5-VL-72B-Instruct"
+  temperature: 0.1
+  max_tokens: 32768
+  timeout_seconds: 600
+  retry_attempts: 3
+  retry_delay_seconds: 2
+
+# OCR Configuration
+ocr:
+  enabled: true
+  languages: ["eng", "ara", "fra"]
+  psm: 6  # Page segmentation mode
+
+# Processing Pipeline
+pipeline:
+  concurrency: 3
+  supported_extensions: [".pdf", ".jpg", ".jpeg", ".png", ".tiff", ".tif", ".bmp"]
+  max_file_size_mb: 50
+
+# Watched Folder
+watcher:
+  enabled: false
+  folder_path: "data/invoices/watch"
+  poll_interval_seconds: 5
+
+# Risk Thresholds (Suspicion Rank Index boundaries)
+risk_thresholds:
+  low: 30       # 0–30 = LOW
+  medium: 60    # 31–60 = MEDIUM
+  high: 100     # 61–100 = HIGH
+
+# Approval Limit (for threshold-splitting detection)
+approval_limit: 10000.0
+
+# Fraud Check Weights (for Suspicion Rank Index calculation)
+# Higher weight = more impact on the final score
+fraud_weights:
+  math_verification: 15
+  duplicate_detection: 12
+  benford_law: 5
+  round_number_bias: 4
+  date_anomalies: 6
+  threshold_splitting: 10
+  ela_analysis: 12
+  pdf_metadata: 8
+  missing_fields: 5
+  vendor_pattern: 8
+  ai_generated: 12
+  font_consistency: 8
+  noise_analysis: 7
+
+# Fraud Check Severities
+fraud_severities:
+  math_verification: "CRITICAL"
+  duplicate_detection: "CRITICAL"
+  benford_law: "MEDIUM"
+  round_number_bias: "MEDIUM"
+  date_anomalies: "MEDIUM"
+  threshold_splitting: "HIGH"
+  ela_analysis: "CRITICAL"
+  pdf_metadata: "HIGH"
+  missing_fields: "MEDIUM"
+  vendor_pattern: "HIGH"
+  ai_generated: "CRITICAL"
+  font_consistency: "CRITICAL"
+  noise_analysis: "HIGH"
+
+# Data Directories
+data:
+  invoices_dir: "data/invoices"
+  results_dir: "data/results"
+  exports_dir: "data/exports"
+  ela_output_dir: "data/ela_output"
+
+# Benford's Law minimum sample size
+benford_min_samples: 10
+
+# Duplicate Detection
+duplicate:
+  fuzzy_threshold: 85  # Similarity percentage for fuzzy match
+  lookback_days: 365   # How far back to check for duplicates
+
+# Date Check
+date_check:
+  max_past_days: 365
+  weekend_flag: true
