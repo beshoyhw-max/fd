@@ -42,13 +42,37 @@ def _detect_tesseract() -> bool:
         return False
 
 
+def _detect_easyocr() -> bool:
+    """Check if EasyOCR is available."""
+    try:
+        import easyocr
+        return True
+    except ImportError:
+        return False
+
+
+def _detect_paddleocr() -> bool:
+    """Check if PaddleOCR is available."""
+    try:
+        import paddleocr
+        return True
+    except ImportError:
+        return False
+
+
 SURYA_AVAILABLE = _detect_surya()
 TESSERACT_AVAILABLE = _detect_tesseract()
+EASYOCR_AVAILABLE = _detect_easyocr()
+PADDLEOCR_AVAILABLE = _detect_paddleocr()
 
 if SURYA_AVAILABLE:
     logger.info("Surya OCR detected — using as primary OCR engine")
+elif PADDLEOCR_AVAILABLE:
+    logger.info("Surya OCR not found, PaddleOCR detected — using as fallback")
+elif EASYOCR_AVAILABLE:
+    logger.info("Surya/PaddleOCR not found, EasyOCR detected — using as fallback")
 elif TESSERACT_AVAILABLE:
-    logger.info("Surya OCR not found, Tesseract OCR detected — using as fallback")
+    logger.info("Surya/PaddleOCR/EasyOCR not found, Tesseract OCR detected — using as fallback")
 else:
     logger.warning("No OCR engine available — OCR fallback disabled")
 
@@ -124,7 +148,7 @@ class _SuryaEngine:
         self._ensure_loaded()
 
         try:
-            predictions = self._recognition([img], languages=[languages])
+            predictions = self._recognition([img])
 
             # Extract text from predictions
             lines = []
@@ -153,7 +177,7 @@ class _SuryaEngine:
         self._ensure_loaded()
 
         try:
-            predictions = self._recognition([img], languages=[languages])
+            predictions = self._recognition([img])
 
             results = []
             for page in predictions:
@@ -193,7 +217,7 @@ class OCRFallback:
     """
     Multi-engine OCR fallback for when Vision LLM is unavailable.
 
-    Priority: Surya OCR → Tesseract OCR → Error
+    Priority: Surya OCR → EasyOCR → Tesseract OCR → Error
 
     Pipeline: Image → OCR → Raw text → LLM text parsing → ExtractedFields
     """
@@ -201,6 +225,15 @@ class OCRFallback:
     def __init__(self, config: Optional[Config] = None):
         self._config = config or Config.get()
         self._vision_extractor = VisionExtractor(self._config)
+        self._easyocr_reader = None
+        self._paddleocr_reader = None
+        if EASYOCR_AVAILABLE:
+            try:
+                import easyocr
+                # Initialize EasyOCR reader - lazy load on first use
+                logger.info("Initializing EasyOCR reader (lazy load)...")
+            except Exception as e:
+                logger.warning(f"Failed to initialize EasyOCR: {e}")
 
     def _get_surya_languages(self) -> List[str]:
         """Get Surya-compatible language codes from config."""
@@ -225,7 +258,21 @@ class OCRFallback:
                     img, self._get_surya_languages()
                 )
             except OCRError:
-                logger.warning("Surya OCR failed, falling back to Tesseract")
+                logger.warning("Surya OCR failed, falling back to PaddleOCR")
+
+        # Try PaddleOCR
+        if PADDLEOCR_AVAILABLE:
+            try:
+                return self._paddleocr_ocr_image(img)
+            except Exception as e:
+                logger.warning(f"PaddleOCR failed: {e}, falling back to EasyOCR")
+
+        # Try EasyOCR
+        if EASYOCR_AVAILABLE:
+            try:
+                return self._easyocr_ocr_image(img)
+            except Exception as e:
+                logger.warning(f"EasyOCR failed: {e}, falling back to Tesseract")
 
         # Fall back to Tesseract
         if TESSERACT_AVAILABLE:
@@ -235,6 +282,45 @@ class OCRFallback:
             "No OCR engine available. Install surya-ocr (recommended) "
             "or pytesseract+Tesseract."
         )
+
+    def _easyocr_ocr_image(self, img: Image.Image) -> str:
+        """Run EasyOCR on a single image."""
+        import easyocr
+        import numpy as np
+
+        if self._easyocr_reader is None:
+            # Lazy load EasyOCR reader with common languages
+            self._easyocr_reader = easyocr.Reader(['ch_sim', 'en'], gpu=True)
+
+        # Convert PIL Image to numpy array
+        img_array = np.array(img)
+        results = self._easyocr_reader.readtext(img_array)
+        lines = []
+        for bbox, text, confidence in results:
+            if text.strip():
+                lines.append(text.strip())
+        result = "\n".join(lines)
+        logger.info(f"EasyOCR extracted {len(result)} characters")
+        return result
+
+    def _paddleocr_ocr_image(self, img: Image.Image) -> str:
+        """Run PaddleOCR on a single image."""
+        from paddleocr import PaddleOCR
+
+        if self._paddleocr_reader is None:
+            # Lazy load PaddleOCR reader
+            self._paddleocr_reader = PaddleOCR(use_angle_cls=True, lang='ch')
+
+        results = self._paddleocr_reader.ocr(img, cls=True)
+        lines = []
+        if results and results[0]:
+            for line in results[0]:
+                text = line[1][0]
+                if text.strip():
+                    lines.append(text.strip())
+        result = "\n".join(lines)
+        logger.info(f"PaddleOCR extracted {len(result)} characters")
+        return result
 
     def _tesseract_ocr_image(self, img: Image.Image) -> str:
         """Run Tesseract OCR on a single image (legacy fallback)."""
@@ -320,13 +406,103 @@ class OCRFallback:
                 if result:
                     return result
             except Exception:
-                logger.warning("Surya per-word data failed, trying Tesseract")
+                logger.warning("Surya per-word data failed, trying PaddleOCR")
+
+        # Try PaddleOCR
+        if PADDLEOCR_AVAILABLE:
+            try:
+                return self._paddleocr_per_char(img)
+            except Exception as e:
+                logger.warning(f"PaddleOCR per-word data failed: {e}, trying EasyOCR")
+
+        # Try EasyOCR
+        if EASYOCR_AVAILABLE:
+            try:
+                return self._easyocr_per_char(img)
+            except Exception as e:
+                logger.warning(f"EasyOCR per-word data failed: {e}, trying Tesseract")
 
         # Fall back to Tesseract
         if TESSERACT_AVAILABLE:
             return self._tesseract_per_char(img)
 
         return []
+
+    def _paddleocr_per_char(self, img: Image.Image) -> List[dict]:
+        """Get per-word OCR data from PaddleOCR."""
+        from paddleocr import PaddleOCR
+
+        if self._paddleocr_reader is None:
+            self._paddleocr_reader = PaddleOCR(use_angle_cls=True, lang='ch')
+
+        results = self._paddleocr_reader.ocr(img, cls=True)
+        word_data = []
+
+        if results and results[0]:
+            for line in results[0]:
+                bbox = line[0]  # [[x1,y1], [x2,y1], [x2,y2], [x1,y2]]
+                text = line[1][0]
+                confidence = line[1][1]
+
+                if not text.strip():
+                    continue
+
+                x1 = min(p[0] for p in bbox)
+                y1 = min(p[1] for p in bbox)
+                x2 = max(p[0] for p in bbox)
+                y2 = max(p[1] for p in bbox)
+                width = x2 - x1
+                height = y2 - y1
+                conf_pct = int(confidence * 100) if confidence else 0
+
+                word_data.append({
+                    "char": text.strip(),
+                    "conf": conf_pct,
+                    "left": int(x1),
+                    "top": int(y1),
+                    "width": int(width),
+                    "height": int(height),
+                })
+
+        logger.info(f"PaddleOCR extracted {len(word_data)} words")
+        return word_data
+
+    def _easyocr_per_char(self, img: Image.Image) -> List[dict]:
+        """Get per-word OCR data from EasyOCR."""
+        import easyocr
+        import numpy as np
+
+        if self._easyocr_reader is None:
+            # Lazy load EasyOCR reader with common languages
+            self._easyocr_reader = easyocr.Reader(['ch_sim', 'en'], gpu=True)
+
+        # Convert PIL Image to numpy array
+        img_array = np.array(img)
+        results = self._easyocr_reader.readtext(img_array)
+        word_data = []
+        for bbox, text, confidence in results:
+            if not text.strip():
+                continue
+            # bbox is [[x1,y1], [x2,y1], [x2,y2], [x1,y2]]
+            x1 = min(p[0] for p in bbox)
+            y1 = min(p[1] for p in bbox)
+            x2 = max(p[0] for p in bbox)
+            y2 = max(p[1] for p in bbox)
+            width = x2 - x1
+            height = y2 - y1
+            conf_pct = int(confidence * 100) if confidence else 0
+
+            word_data.append({
+                "char": text.strip(),
+                "conf": conf_pct,
+                "left": int(x1),
+                "top": int(y1),
+                "width": int(width),
+                "height": int(height),
+            })
+
+        logger.info(f"EasyOCR extracted {len(word_data)} words")
+        return word_data
 
     def _tesseract_per_char(self, img: Image.Image) -> List[dict]:
         """Get per-character OCR data from Tesseract (legacy fallback)."""
